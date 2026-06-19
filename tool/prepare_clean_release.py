@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
@@ -80,6 +81,30 @@ def _find_release_layout(release_dir: Path) -> Optional[Tuple[Path, Path]]:
     return None
 
 
+def _macos_release_root(exe_path: Path) -> Optional[Path]:
+    for parent in exe_path.parents:
+        if parent.suffix == ".app":
+            return parent.parent
+    return None
+
+
+def _install_macos_runtime(repo_root: Path, exe_path: Path) -> None:
+    release_root = _macos_release_root(exe_path)
+    if release_root is None:
+        return
+    script = repo_root / "tool" / "ensure_macos_environment.py"
+    subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--skip-flutter",
+            "--install-runtime-to",
+            str(release_root),
+        ],
+        check=True,
+    )
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print("用法: python3 tool/prepare_clean_release.py <release_dir>")
@@ -117,6 +142,7 @@ def main() -> int:
 
     db_path = database_dir / "asr_tools.db"
     _initialize_clean_database(db_path, repo_root)
+    _install_macos_runtime(repo_root, exe_path)
 
     print(f"已清理发布目录数据: {release_dir}")
     print(f"- executable: {exe_path}")

@@ -1,7 +1,10 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:asr_tools/core/extensions.dart';
 import 'package:asr_tools/models/media_file.dart';
+import 'package:asr_tools/providers/settings_provider.dart';
 
 void main() {
   test('string path helpers parse file names and extensions', () {
@@ -47,5 +50,20 @@ void main() {
     expect(restored.thumbnailPath, r'G:\data\thumbs\video-1.jpg');
     expect(restored.filePath, file.filePath);
     expect(restored.type, MediaType.video);
+  });
+
+  test('settings ignore stale Windows tool paths on non-Windows systems', () {
+    final settings = AppSettings.fromMap({
+      'ffmpeg_path': r'G:\data\app\DIT\ffmpeg',
+      'sherpa_onnx_path': r'G:\data\app\DIT\sherpa-onnx',
+    });
+
+    if (Platform.isWindows) {
+      expect(settings.ffmpegPath, r'G:\data\app\DIT\ffmpeg');
+      expect(settings.sherpaOnnxPath, r'G:\data\app\DIT\sherpa-onnx');
+    } else {
+      expect(settings.ffmpegPath, isNot(startsWith('G:')));
+      expect(settings.sherpaOnnxPath, isEmpty);
+    }
   });
 }

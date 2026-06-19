@@ -49,6 +49,14 @@ class FfmpegService {
       return;
     }
 
+    final directFile = File(trimmed);
+    if (directFile.existsSync() && p.basename(trimmed) == _ffmpegName) {
+      final parent = directFile.parent.path;
+      _ffmpegExecutable = trimmed;
+      _ffprobeExecutable = p.join(parent, _ffprobeName);
+      return;
+    }
+
     // 优先使用直接路径，若找不到可执行文件则尝试 bin 子目录
     for (final candidateDir in [trimmed, p.join(trimmed, 'bin')]) {
       final ffmpeg = p.join(candidateDir, _ffmpegName);

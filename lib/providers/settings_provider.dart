@@ -13,9 +13,13 @@ class AppSettings {
       return r'G:\data\app\DIT\ffmpeg';
     }
     if (Platform.isMacOS) {
-      const candidates = ['/opt/homebrew/bin', '/usr/local/bin'];
+      final candidates = [
+        ..._bundledMacOSFfmpegDirs(),
+        '/opt/homebrew/bin',
+        '/usr/local/bin',
+      ];
       for (final dir in candidates) {
-        if (File('$dir/ffmpeg').existsSync()) {
+        if (_hasFfmpegPair(dir)) {
           return dir;
         }
       }
@@ -29,6 +33,39 @@ class AppSettings {
       return r'G:\data\app\DIT\sherpa-onnx';
     }
     return '';
+  }
+
+  static List<String> _bundledMacOSFfmpegDirs() {
+    final appParent = _macOSAppBundleParentPath();
+    if (appParent == null) return const [];
+    return [
+      '$appParent/runtime/ffmpeg/macos-x64/bin',
+      '$appParent/runtime/ffmpeg/macos-arm64/bin',
+    ];
+  }
+
+  static String? _macOSAppBundleParentPath() {
+    var dir = File(Platform.resolvedExecutable).parent;
+    while (dir.path != dir.parent.path) {
+      if (dir.path.endsWith('.app')) {
+        return dir.parent.path;
+      }
+      dir = dir.parent;
+    }
+    return null;
+  }
+
+  static bool _hasFfmpegPair(String dir) =>
+      File('$dir/ffmpeg').existsSync() && File('$dir/ffprobe').existsSync();
+
+  static bool _looksLikeWindowsPath(String path) =>
+      RegExp(r'^[A-Za-z]:[\\/]').hasMatch(path);
+
+  static String _configuredToolPath(Object? rawValue, String fallback) {
+    final value = (rawValue as String?)?.trim() ?? '';
+    if (value.isEmpty) return fallback;
+    if (!Platform.isWindows && _looksLikeWindowsPath(value)) return fallback;
+    return value;
   }
 
   final String ffmpegPath;
@@ -141,8 +178,11 @@ class AppSettings {
   };
 
   factory AppSettings.fromMap(Map<String, dynamic> map) => AppSettings(
-    ffmpegPath: map['ffmpeg_path'] as String? ?? defaultFfmpegPath,
-    sherpaOnnxPath: map['sherpa_onnx_path'] as String? ?? defaultSherpaOnnxPath,
+    ffmpegPath: _configuredToolPath(map['ffmpeg_path'], defaultFfmpegPath),
+    sherpaOnnxPath: _configuredToolPath(
+      map['sherpa_onnx_path'],
+      defaultSherpaOnnxPath,
+    ),
     modelPath: map['model_path'] as String? ?? '',
     proxyAddress: map['proxy_address'] as String? ?? '192.168.0.211:7890',
     vadMode: map['vad_mode'] as String? ?? 'long_audio',
