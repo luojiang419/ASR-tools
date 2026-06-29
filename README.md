@@ -148,12 +148,15 @@ This project is not trying to become a general-purpose NLE. Its purpose is to ma
 
 ### 6. 数据与持久化思路
 
-项目现在采用“可执行程序同级 `data/` 目录”的持久化方式：
+项目现在采用“按平台选择可写 `data/` 目录”的持久化方式：
 
-- `data/config`：设置
-- `data/database`：SQLite 数据库
-- `data/projects`：工程级缓存与缩略图
-- `data/temp`：临时文件
+- Windows：默认使用可执行程序同级 `data/`
+- macOS：默认使用 `Application Support` 下的 `data/`
+- 目录结构统一为：
+  - `data/config`：设置
+  - `data/database`：SQLite 数据库
+  - `data/projects`：工程级缓存与缩略图
+  - `data/temp`：临时文件
 
 这样做的原因是：
 

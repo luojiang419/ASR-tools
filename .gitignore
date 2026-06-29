@@ -32,6 +32,7 @@ migrate_working_dir/
 .pub/
 /build/
 /coverage/
+/.toolchain/
 /backup/
 /dist/
 /output/
@@ -41,9 +42,6 @@ app.*.symbols
 
 # Obfuscation related
 app.*.map.json
-
-# Flutter build artifacts (local only)
-/windows/
 
 # SSH Keys
 /公钥/
