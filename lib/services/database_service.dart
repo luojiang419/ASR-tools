@@ -943,11 +943,25 @@ class DatabaseService {
     MediaType mediaType,
     List<SubtitleWindow> windows,
   ) async {
+    await clearSubtitleWindows(projectId, mediaType);
+    await insertSubtitleWindows(windows);
+  }
+
+  static Future<void> clearSubtitleWindows(
+    String projectId,
+    MediaType mediaType,
+  ) async {
     await database.delete(
       'subtitle_windows',
       where: 'project_id = ? AND media_type = ?',
       whereArgs: [projectId, mediaType.name],
     );
+  }
+
+  static Future<void> insertSubtitleWindows(
+    List<SubtitleWindow> windows,
+  ) async {
+    if (windows.isEmpty) return;
     final batch = database.batch();
     for (final window in windows) {
       batch.insert('subtitle_windows', window.toMap());

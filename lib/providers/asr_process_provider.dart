@@ -115,6 +115,8 @@ class AsrProcessNotifier extends AsyncNotifier<AsrProcessState> {
     List<MediaFile> files, {
     required bool skipExisting,
   }) async {
+    if (files.isEmpty) return const [];
+
     if (!skipExisting) {
       return files
           .map(
@@ -127,25 +129,20 @@ class AsrProcessNotifier extends AsyncNotifier<AsrProcessState> {
           .toList();
     }
 
+    final clipCounts = await DatabaseService.getPreparedSubtitleCountByMediaId(
+      files.first.projectId,
+    );
     final progresses = <AsrFileProgress>[];
     for (final file in files) {
-      final clips = await DatabaseService.getSubtitleClips(file.id);
-      if (clips.isNotEmpty) {
+      final clipCount = clipCounts[file.id] ?? 0;
+      if (clipCount > 0) {
         progresses.add(
           AsrFileProgress(
             mediaFileId: file.id,
             fileName: file.filePath.split(RegExp(r'[/\\]')).last,
             status: AsrFileStatus.completed,
             progress: 1.0,
-            segments: clips
-                .map(
-                  (c) => AsrSegment(
-                    startTime: c.startMs / 1000.0,
-                    endTime: c.endMs / 1000.0,
-                    text: c.text,
-                  ),
-                )
-                .toList(),
+            segmentCount: clipCount,
           ),
         );
         continue;
@@ -359,9 +356,11 @@ class AsrProcessNotifier extends AsyncNotifier<AsrProcessState> {
     final files = await _getRecognizableFiles(projectId);
     if (files.isEmpty) return false;
 
+    final clipCounts = await DatabaseService.getPreparedSubtitleCountByMediaId(
+      projectId,
+    );
     for (final file in files) {
-      final clips = await DatabaseService.getSubtitleClips(file.id);
-      if (clips.isEmpty) {
+      if ((clipCounts[file.id] ?? 0) == 0) {
         return true;
       }
     }

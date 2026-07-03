@@ -32,6 +32,7 @@ class SubtitlePrepareService {
   SubtitlePrepareService._();
 
   static const _uuid = Uuid();
+  static const _windowWriteBatchSize = 500;
 
   static String normalizeTextForMatching(String text) {
     final normalized = _normalizeFullWidth(text).toLowerCase();
@@ -98,14 +99,12 @@ class SubtitlePrepareService {
 
     int parsedFiles = 0;
     int generatedClips = 0;
-    final allAudioLocalClips = <SubtitleClip>[];
 
     generatedClips += await _prepareSubtitleGroup(
       projectId: projectId,
       mediaType: MediaType.video,
       mediaFiles: preparedVideos,
       subtitleFiles: videoSubtitleFiles,
-      captureAudioClipsInto: null,
       onParsed: () => parsedFiles++,
     );
     generatedClips += await _prepareSubtitleGroup(
@@ -113,25 +112,18 @@ class SubtitlePrepareService {
       mediaType: MediaType.audio,
       mediaFiles: preparedAudios,
       subtitleFiles: audioSubtitleFiles,
-      captureAudioClipsInto: allAudioLocalClips,
       onParsed: () => parsedFiles++,
     );
 
-    final audioWindows = _buildWindows(
+    final generatedWindows = await _rebuildAudioWindows(
       projectId,
-      MediaType.audio,
-      allAudioLocalClips,
-    );
-    await DatabaseService.replaceSubtitleWindows(
-      projectId,
-      MediaType.audio,
-      audioWindows,
+      preparedAudios,
     );
 
     return SubtitlePrepareSummary(
       parsedSubtitleFiles: parsedFiles,
       generatedSubtitleClips: generatedClips,
-      generatedWindows: audioWindows.length,
+      generatedWindows: generatedWindows,
       preparedVideos: preparedVideos.length,
       preparedAudios: preparedAudios.length,
     );
@@ -189,7 +181,6 @@ class SubtitlePrepareService {
     required MediaType mediaType,
     required List<MediaFile> mediaFiles,
     required List<SubtitleFile> subtitleFiles,
-    required List<SubtitleClip>? captureAudioClipsInto,
     required void Function() onParsed,
   }) async {
     if (subtitleFiles.isEmpty || mediaFiles.isEmpty) return 0;
@@ -244,9 +235,6 @@ class SubtitlePrepareService {
         if (localClips.isNotEmpty) {
           await DatabaseService.insertSubtitleClips(localClips);
           generated += localClips.length;
-          if (captureAudioClipsInto != null) {
-            captureAudioClipsInto.addAll(localClips);
-          }
         }
       } catch (_) {
         await DatabaseService.updateSubtitleFile(
@@ -255,14 +243,8 @@ class SubtitlePrepareService {
       }
     }
 
-    final subtitlesByMedia = <String, List<SubtitleClip>>{};
     for (final media in mediaFiles) {
-      subtitlesByMedia[media.id] = await DatabaseService.getSubtitleClips(
-        media.id,
-      );
-    }
-    for (final media in mediaFiles) {
-      final clips = subtitlesByMedia[media.id] ?? const <SubtitleClip>[];
+      final clips = await DatabaseService.getSubtitleClips(media.id);
       await DatabaseService.updateMediaFile(
         media.copyWith(
           subtitleStatus: clips.isNotEmpty
@@ -270,6 +252,59 @@ class SubtitlePrepareService {
               : SubtitleStatus.pending,
         ),
       );
+    }
+
+    return generated;
+  }
+
+  static Future<int> _rebuildAudioWindows(
+    String projectId,
+    List<MediaFile> audioFiles,
+  ) async {
+    final frequency = <String, int>{};
+
+    for (final audio in audioFiles) {
+      final clips = await DatabaseService.getSubtitleClips(audio.id);
+      final drafts = _buildWindowDraftsForMedia(
+        projectId: projectId,
+        mediaType: MediaType.audio,
+        mediaId: audio.id,
+        clips: clips,
+      );
+      for (final draft in drafts) {
+        frequency.update(
+          draft.normalizedText,
+          (value) => value + 1,
+          ifAbsent: () => 1,
+        );
+      }
+    }
+
+    await DatabaseService.clearSubtitleWindows(projectId, MediaType.audio);
+
+    var generated = 0;
+    for (final audio in audioFiles) {
+      final clips = await DatabaseService.getSubtitleClips(audio.id);
+      final drafts = _buildWindowDraftsForMedia(
+        projectId: projectId,
+        mediaType: MediaType.audio,
+        mediaId: audio.id,
+        clips: clips,
+      );
+      if (drafts.isEmpty) continue;
+
+      final windows = drafts
+          .map((draft) {
+            final count = frequency[draft.normalizedText] ?? 1;
+            return draft.toWindow(count);
+          })
+          .toList(growable: false);
+
+      for (var i = 0; i < windows.length; i += _windowWriteBatchSize) {
+        final end = math.min(i + _windowWriteBatchSize, windows.length);
+        await DatabaseService.insertSubtitleWindows(windows.sublist(i, end));
+      }
+      generated += windows.length;
     }
 
     return generated;
@@ -491,75 +526,48 @@ class SubtitlePrepareService {
     );
   }
 
-  static List<SubtitleWindow> _buildWindows(
-    String projectId,
-    MediaType mediaType,
-    List<SubtitleClip> clips,
-  ) {
-    final byMedia = <String, List<SubtitleClip>>{};
-    for (final clip in clips) {
-      final mediaId = clip.mediaFileId;
-      if (mediaId == null) continue;
-      byMedia.putIfAbsent(mediaId, () => []).add(clip);
-    }
+  static List<_WindowDraft> _buildWindowDraftsForMedia({
+    required String projectId,
+    required MediaType mediaType,
+    required String mediaId,
+    required List<SubtitleClip> clips,
+  }) {
+    if (clips.isEmpty) return const [];
 
-    final provisional = <SubtitleWindow>[];
-    final frequency = <String, int>{};
+    final mediaClips = [...clips]
+      ..sort((a, b) => a.sortOrder.compareTo(b.sortOrder));
+    final drafts = <_WindowDraft>[];
     final now = DateTime.now();
 
-    byMedia.forEach((mediaId, mediaClips) {
-      mediaClips.sort((a, b) => a.sortOrder.compareTo(b.sortOrder));
-      for (final windowSize in AppConstants.subtitleWindowSizes) {
-        if (mediaClips.length < windowSize) continue;
-        for (var i = 0; i <= mediaClips.length - windowSize; i++) {
-          final slice = mediaClips.sublist(i, i + windowSize);
-          final normalizedText = slice
-              .map((clip) => clip.normalizedText)
-              .where((text) => text.isNotEmpty)
-              .join(' ');
-          if (normalizedText.isEmpty) continue;
-          frequency.update(
-            normalizedText,
-            (value) => value + 1,
-            ifAbsent: () => 1,
-          );
-          provisional.add(
-            SubtitleWindow(
-              id: _uuid.v4(),
-              projectId: projectId,
-              mediaFileId: mediaId,
-              mediaType: mediaType,
-              windowSize: windowSize,
-              startMs: slice.first.localStartMs ?? slice.first.startMs,
-              endMs: slice.last.localEndMs ?? slice.last.endMs,
-              text: slice.map((clip) => clip.text).join(' '),
-              normalizedText: normalizedText,
-              cueIds: slice.map((clip) => clip.id).join(','),
-              uniquenessWeight: lowValuePhraseMultiplier(normalizedText),
-              createdAt: now,
-            ),
-          );
-        }
+    for (final windowSize in AppConstants.subtitleWindowSizes) {
+      if (mediaClips.length < windowSize) continue;
+      for (var i = 0; i <= mediaClips.length - windowSize; i++) {
+        final slice = mediaClips.sublist(i, i + windowSize);
+        final normalizedText = slice
+            .map((clip) => clip.normalizedText)
+            .where((text) => text.isNotEmpty)
+            .join(' ');
+        if (normalizedText.isEmpty) continue;
+        drafts.add(
+          _WindowDraft(
+            id: _uuid.v4(),
+            projectId: projectId,
+            mediaFileId: mediaId,
+            mediaType: mediaType,
+            windowSize: windowSize,
+            startMs: slice.first.localStartMs ?? slice.first.startMs,
+            endMs: slice.last.localEndMs ?? slice.last.endMs,
+            text: slice.map((clip) => clip.text).join(' '),
+            normalizedText: normalizedText,
+            cueIds: slice.map((clip) => clip.id).join(','),
+            baseWeight: lowValuePhraseMultiplier(normalizedText),
+            createdAt: now,
+          ),
+        );
       }
-    });
+    }
 
-    return provisional.map((window) {
-      final count = frequency[window.normalizedText] ?? 1;
-      return SubtitleWindow(
-        id: window.id,
-        projectId: window.projectId,
-        mediaFileId: window.mediaFileId,
-        mediaType: window.mediaType,
-        windowSize: window.windowSize,
-        startMs: window.startMs,
-        endMs: window.endMs,
-        text: window.text,
-        normalizedText: window.normalizedText,
-        cueIds: window.cueIds,
-        uniquenessWeight: (1 / count) * window.uniquenessWeight,
-        createdAt: window.createdAt,
-      );
-    }).toList();
+    return drafts;
   }
 
   static Future<List<_ParsedCue>> _parseSrtFile(String filePath) async {
@@ -703,4 +711,51 @@ class _CueOverlap {
     required this.localStartMs,
     required this.localEndMs,
   });
+}
+
+class _WindowDraft {
+  final String id;
+  final String projectId;
+  final String mediaFileId;
+  final MediaType mediaType;
+  final int windowSize;
+  final int startMs;
+  final int endMs;
+  final String text;
+  final String normalizedText;
+  final String cueIds;
+  final double baseWeight;
+  final DateTime createdAt;
+
+  const _WindowDraft({
+    required this.id,
+    required this.projectId,
+    required this.mediaFileId,
+    required this.mediaType,
+    required this.windowSize,
+    required this.startMs,
+    required this.endMs,
+    required this.text,
+    required this.normalizedText,
+    required this.cueIds,
+    required this.baseWeight,
+    required this.createdAt,
+  });
+
+  SubtitleWindow toWindow(int duplicateCount) {
+    return SubtitleWindow(
+      id: id,
+      projectId: projectId,
+      mediaFileId: mediaFileId,
+      mediaType: mediaType,
+      windowSize: windowSize,
+      startMs: startMs,
+      endMs: endMs,
+      text: text,
+      normalizedText: normalizedText,
+      cueIds: cueIds,
+      uniquenessWeight: (1 / duplicateCount) * baseWeight,
+      createdAt: createdAt,
+    );
+  }
 }

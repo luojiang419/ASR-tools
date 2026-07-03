@@ -18,7 +18,7 @@ class AsrFileProgress {
   final AsrFileStatus status;
   final double progress;
   final String? errorMessage;
-  final List<AsrSegment> segments;
+  final int segmentCount;
 
   const AsrFileProgress({
     required this.mediaFileId,
@@ -26,14 +26,14 @@ class AsrFileProgress {
     this.status = AsrFileStatus.pending,
     this.progress = 0.0,
     this.errorMessage,
-    this.segments = const [],
+    this.segmentCount = 0,
   });
 
   AsrFileProgress copyWith({
     AsrFileStatus? status,
     double? progress,
     String? errorMessage,
-    List<AsrSegment>? segments,
+    int? segmentCount,
   }) {
     return AsrFileProgress(
       mediaFileId: mediaFileId,
@@ -41,7 +41,7 @@ class AsrFileProgress {
       status: status ?? this.status,
       progress: progress ?? this.progress,
       errorMessage: errorMessage,
-      segments: segments ?? this.segments,
+      segmentCount: segmentCount ?? this.segmentCount,
     );
   }
 }
@@ -147,6 +147,7 @@ class AsrBatchService {
                 fileName: fileName,
                 status: AsrFileStatus.skipped,
                 progress: 1.0,
+                segmentCount: existingClips.length,
               ),
             );
             return;
@@ -190,7 +191,7 @@ class AsrBatchService {
               fileName: fileName,
               status: AsrFileStatus.completed,
               progress: 1.0,
-              segments: segments,
+              segmentCount: segments.length,
             ),
           );
         } on AsrCancelledException catch (e) {

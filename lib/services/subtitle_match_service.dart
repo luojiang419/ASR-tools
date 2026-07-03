@@ -229,6 +229,200 @@ class LimitedCandidateBucket<T> {
   }
 }
 
+class _MatchRuntimeData {
+  final List<MediaFile> videos;
+  final Map<String, MediaFile> audioById;
+  final Map<String, dynamic> workerPayload;
+
+  const _MatchRuntimeData({
+    required this.videos,
+    required this.audioById,
+    required this.workerPayload,
+  });
+}
+
+class _MatchWorkerIndex {
+  final String projectId;
+  final Map<String, _WorkerMedia> audioMap;
+  final Map<int, List<_WorkerWindow>> audioWindowsBySize;
+
+  const _MatchWorkerIndex({
+    required this.projectId,
+    required this.audioMap,
+    required this.audioWindowsBySize,
+  });
+
+  factory _MatchWorkerIndex.fromPayload(Map<String, dynamic> payload) {
+    final audios = (payload['audios'] as List<dynamic>)
+        .cast<Map<String, dynamic>>()
+        .map(_WorkerMedia.fromMap)
+        .toList(growable: false);
+    final audioWindows = (payload['audio_windows'] as List<dynamic>)
+        .cast<Map<String, dynamic>>()
+        .map(_WorkerWindow.fromMap)
+        .toList(growable: false);
+
+    return _MatchWorkerIndex(
+      projectId: payload['project_id'] as String,
+      audioMap: {for (final audio in audios) audio.id: audio},
+      audioWindowsBySize: SubtitleMatchService._groupAudioWindowsBySize(
+        audioWindows,
+      ),
+    );
+  }
+}
+
+class _MatchWorkerSession {
+  final Isolate _worker;
+  final ReceivePort _receivePort;
+  final StreamSubscription<dynamic> _subscription;
+  final SendPort _commandPort;
+  final Map<int, Completer<Map<String, dynamic>>> _pendingRequests;
+  bool _disposed = false;
+  int _nextRequestId = 0;
+
+  _MatchWorkerSession._({
+    required Isolate worker,
+    required ReceivePort receivePort,
+    required StreamSubscription<dynamic> subscription,
+    required SendPort commandPort,
+    required Map<int, Completer<Map<String, dynamic>>> pendingRequests,
+  }) : _worker = worker,
+       _receivePort = receivePort,
+       _subscription = subscription,
+       _commandPort = commandPort,
+       _pendingRequests = pendingRequests;
+
+  static Future<_MatchWorkerSession> start(Map<String, dynamic> payload) async {
+    final receivePort = ReceivePort();
+    final pendingRequests = <int, Completer<Map<String, dynamic>>>{};
+    final readyCompleter = Completer<SendPort>();
+
+    late final StreamSubscription<dynamic> subscription;
+    subscription = receivePort.listen((message) {
+      if (message is! Map) return;
+      final typed = message.cast<Object?, Object?>();
+      final type = typed['type'];
+
+      if (type == 'ready') {
+        if (!readyCompleter.isCompleted) {
+          readyCompleter.complete(typed['send_port'] as SendPort);
+        }
+        return;
+      }
+
+      if (type == 'fatal_error') {
+        final error = Exception('${typed['error'] ?? '匹配 worker 初始化失败'}');
+        if (!readyCompleter.isCompleted) {
+          readyCompleter.completeError(error);
+        }
+        for (final completer in pendingRequests.values) {
+          if (!completer.isCompleted) {
+            completer.completeError(error);
+          }
+        }
+        pendingRequests.clear();
+        return;
+      }
+
+      final requestId = typed['request_id'] as int?;
+      if (requestId == null) return;
+
+      final completer = pendingRequests.remove(requestId);
+      if (completer == null || completer.isCompleted) return;
+
+      if (type == 'video_done') {
+        completer.complete((typed['payload'] as Map).cast<String, dynamic>());
+        return;
+      }
+
+      if (type == 'video_error') {
+        completer.completeError(
+          Exception('${typed['error'] ?? '匹配 worker 执行失败'}'),
+        );
+      }
+    });
+
+    final worker = await Isolate.spawn<Map<String, dynamic>>(
+      SubtitleMatchService._matchWorkerSessionEntry,
+      {'reply_port': receivePort.sendPort, 'payload': payload},
+    );
+
+    try {
+      final commandPort = await readyCompleter.future;
+      return _MatchWorkerSession._(
+        worker: worker,
+        receivePort: receivePort,
+        subscription: subscription,
+        commandPort: commandPort,
+        pendingRequests: pendingRequests,
+      );
+    } catch (_) {
+      await subscription.cancel();
+      receivePort.close();
+      worker.kill(priority: Isolate.immediate);
+      rethrow;
+    }
+  }
+
+  Future<Map<String, dynamic>> scoreVideo({
+    required MediaFile video,
+    required List<SubtitleClip> videoClips,
+    required String? previousAudioId,
+    required int? previousAudioSourceIn,
+  }) async {
+    if (_disposed) {
+      throw const MatchCancelledException();
+    }
+
+    final requestId = _nextRequestId++;
+    final completer = Completer<Map<String, dynamic>>();
+    _pendingRequests[requestId] = completer;
+
+    _commandPort.send({
+      'type': 'score_video',
+      'request_id': requestId,
+      'video': video.toMap(),
+      'video_clips': videoClips.map((clip) => clip.toMap()).toList(),
+      'previous_audio_id': previousAudioId,
+      'previous_audio_source_in': previousAudioSourceIn,
+    });
+
+    return completer.future;
+  }
+
+  void cancel() {
+    if (_disposed) return;
+    _disposed = true;
+
+    for (final completer in _pendingRequests.values) {
+      if (!completer.isCompleted) {
+        completer.completeError(const MatchCancelledException());
+      }
+    }
+    _pendingRequests.clear();
+
+    try {
+      _commandPort.send({'type': 'dispose'});
+    } catch (_) {}
+
+    unawaited(_subscription.cancel());
+    _receivePort.close();
+    _worker.kill(priority: Isolate.immediate);
+  }
+
+  Future<void> dispose() async {
+    if (_disposed) return;
+    _disposed = true;
+    try {
+      _commandPort.send({'type': 'dispose'});
+    } catch (_) {}
+    await _subscription.cancel();
+    _receivePort.close();
+    _worker.kill(priority: Isolate.immediate);
+  }
+}
+
 class SubtitleMatchService {
   SubtitleMatchService._();
 
@@ -280,7 +474,7 @@ class SubtitleMatchService {
       ),
     );
 
-    final payload = await _buildWorkerPayload(projectId);
+    final runtime = await _buildMatchRuntimeData(projectId);
 
     if (controller?.isCancelled == true) {
       throw const MatchCancelledException();
@@ -290,42 +484,219 @@ class SubtitleMatchService {
       MatchProgressUpdate(
         stage: '启动后台任务',
         current: 0,
-        total: (payload['videos'] as List).length,
+        total: runtime.videos.length,
         progress: 0.02,
       ),
     );
 
-    final result = await _runWorker(
-      payload,
-      onProgress: onProgress,
-      controller: controller,
-    );
+    final candidates = <MatchCandidate>[];
+    final syncResults = <SyncResult>[];
+    final anchors = <AnchorPair>[];
+    final totalVideos = runtime.videos.length;
+    String? previousAudioId;
+    int? previousAudioSourceIn;
 
-    if (controller?.isCancelled == true) {
-      throw const MatchCancelledException();
+    final worker = await _MatchWorkerSession.start(runtime.workerPayload);
+    controller?.bindCancel(worker.cancel);
+
+    try {
+      for (var index = 0; index < runtime.videos.length; index++) {
+        if (controller?.isCancelled == true) {
+          throw const MatchCancelledException();
+        }
+
+        final video = runtime.videos[index];
+        final currentVideo = p.basename(video.filePath);
+        onProgress?.call(
+          MatchProgressUpdate(
+            stage: '检索候选',
+            current: index + 1,
+            total: totalVideos,
+            currentVideo: currentVideo,
+            progress: totalVideos == 0
+                ? 0.02
+                : 0.02 + ((index + 0.2) / totalVideos) * 0.78,
+          ),
+        );
+
+        final videoClips = await DatabaseService.getSubtitleClips(video.id);
+        if (controller?.isCancelled == true) {
+          throw const MatchCancelledException();
+        }
+
+        if (videoClips.isEmpty) {
+          syncResults.add(
+            SyncResult(
+              id: _uuid.v4(),
+              projectId: projectId,
+              videoFileId: video.id,
+              audioFileId: null,
+              videoDurationMs: video.durationMs ?? 0,
+              timelineStartMs: video.layoutStartMs,
+              timelineEndMs: video.layoutEndMs,
+              confidence: 0.0,
+              status: SyncStatus.noSubtitle,
+              method: SyncMethod.subtitleOnly,
+              reviewStatus: SyncReviewStatus.pending,
+              notes: '视频没有可用字幕',
+              createdAt: DateTime.now(),
+            ),
+          );
+          continue;
+        }
+
+        final workerResult = await worker.scoreVideo(
+          video: video,
+          videoClips: videoClips,
+          previousAudioId: previousAudioId,
+          previousAudioSourceIn: previousAudioSourceIn,
+        );
+        if (controller?.isCancelled == true) {
+          throw const MatchCancelledException();
+        }
+
+        final orderedCandidates =
+            (workerResult['match_candidates'] as List<dynamic>? ?? const [])
+                .cast<Map<String, dynamic>>()
+                .map(MatchCandidate.fromMap)
+                .toList(growable: false);
+        candidates.addAll(orderedCandidates);
+
+        if (orderedCandidates.isEmpty ||
+            orderedCandidates.first.totalScore <
+                AppConstants.matchConfidenceLow) {
+          syncResults.add(
+            SyncResult(
+              id: _uuid.v4(),
+              projectId: projectId,
+              videoFileId: video.id,
+              audioFileId: null,
+              videoDurationMs: video.durationMs ?? 0,
+              timelineStartMs: video.layoutStartMs,
+              timelineEndMs: video.layoutEndMs,
+              confidence: orderedCandidates.isEmpty
+                  ? 0.0
+                  : orderedCandidates.first.totalScore,
+              status: SyncStatus.noMatch,
+              method: SyncMethod.subtitleOnly,
+              reviewStatus: SyncReviewStatus.pending,
+              notes: '未命中音频字幕库',
+              createdAt: DateTime.now(),
+            ),
+          );
+          continue;
+        }
+
+        onProgress?.call(
+          MatchProgressUpdate(
+            stage: '求锚点',
+            current: index + 1,
+            total: totalVideos,
+            currentVideo: currentVideo,
+            progress: totalVideos == 0
+                ? 0.02
+                : 0.02 + ((index + 0.7) / totalVideos) * 0.88,
+          ),
+        );
+
+        final best = orderedCandidates.first;
+        final bestAudio = runtime.audioById[best.audioFileId];
+        final bestAudioClips = bestAudio == null
+            ? const <SubtitleClip>[]
+            : await DatabaseService.getSubtitleClips(best.audioFileId);
+        final anchorBundle = _buildAnchors(
+          syncResultId: _uuid.v4(),
+          videoClips: videoClips
+              .map(_WorkerClip.fromSubtitleClip)
+              .toList(growable: false),
+          audioClips: bestAudioClips
+              .map(_WorkerClip.fromSubtitleClip)
+              .toList(growable: false),
+          fallbackOffsetMs: best.fallbackOffsetMs,
+        );
+
+        var audioSourceInMs = anchorBundle.offsetMs;
+        var audioSourceOutMs = audioSourceInMs + (video.durationMs ?? 0);
+
+        var sourceClamped = false;
+        var audioTooShort = false;
+        if (audioSourceInMs < 0) {
+          sourceClamped = true;
+          audioSourceInMs = 0;
+          audioSourceOutMs = video.durationMs ?? 0;
+        }
+
+        final audioDurationMs = bestAudio?.durationMs ?? 0;
+        if (audioDurationMs > 0 && audioSourceOutMs > audioDurationMs) {
+          audioTooShort = true;
+          audioSourceOutMs = audioDurationMs;
+          if (audioSourceOutMs < audioSourceInMs) {
+            audioSourceOutMs = audioSourceInMs;
+          }
+        }
+
+        var confidence = best.totalScore;
+        if (videoClips.length < 2) {
+          confidence = math.min(
+            confidence,
+            AppConstants.matchConfidenceMedium + 0.05,
+          );
+        }
+        if (sourceClamped || audioTooShort) {
+          confidence *= 0.88;
+        }
+        if (anchorBundle.anchors.length <= 1) {
+          confidence *= 0.92;
+        }
+        confidence = confidence.clamp(0.0, 1.0);
+
+        final status = _buildStatus(
+          confidence: confidence,
+          sourceClamped: sourceClamped,
+          audioTooShort: audioTooShort,
+          hasSubtitle: true,
+          hasAudio: bestAudio != null,
+        );
+
+        syncResults.add(
+          SyncResult(
+            id: anchorBundle.syncResultId,
+            projectId: projectId,
+            videoFileId: video.id,
+            audioFileId: best.audioFileId,
+            videoDurationMs: video.durationMs ?? 0,
+            timelineStartMs: video.layoutStartMs,
+            timelineEndMs: video.layoutEndMs,
+            audioSourceInMs: audioSourceInMs,
+            audioSourceOutMs: audioSourceOutMs,
+            confidence: confidence,
+            status: status,
+            method: SyncMethod.subtitleOnly,
+            anchorCount: anchorBundle.anchors.length,
+            sourceClamped: sourceClamped,
+            audioTooShort: audioTooShort,
+            reviewStatus: _initialReviewStatusForStatus(status),
+            notes: anchorBundle.notes,
+            createdAt: DateTime.now(),
+          ),
+        );
+        anchors.addAll(anchorBundle.anchors);
+
+        previousAudioId = best.audioFileId;
+        previousAudioSourceIn = audioSourceInMs;
+      }
+    } finally {
+      await worker.dispose();
     }
 
     onProgress?.call(
       MatchProgressUpdate(
         stage: '写入结果',
-        current: (payload['videos'] as List).length,
-        total: (payload['videos'] as List).length,
+        current: totalVideos,
+        total: totalVideos,
         progress: 0.98,
       ),
     );
-
-    final candidates = (result['match_candidates'] as List<dynamic>)
-        .cast<Map<String, dynamic>>()
-        .map(MatchCandidate.fromMap)
-        .toList();
-    final syncResults = (result['sync_results'] as List<dynamic>)
-        .cast<Map<String, dynamic>>()
-        .map(SyncResult.fromMap)
-        .toList();
-    final anchors = (result['anchor_pairs'] as List<dynamic>)
-        .cast<Map<String, dynamic>>()
-        .map(AnchorPair.fromMap)
-        .toList();
 
     await DatabaseService.replaceMatchCandidates(projectId, candidates);
     await DatabaseService.replaceSyncResults(projectId, syncResults);
@@ -1006,7 +1377,7 @@ class SubtitleMatchService {
     await DatabaseService.replaceSyncResults(projectId, retained);
   }
 
-  static Future<Map<String, dynamic>> _buildWorkerPayload(
+  static Future<_MatchRuntimeData> _buildMatchRuntimeData(
     String projectId,
   ) async {
     final videos = await DatabaseService.getMediaFiles(
@@ -1032,332 +1403,97 @@ class SubtitleMatchService {
       mediaType: MediaType.audio,
     );
 
-    final videoClipsById = <String, List<Map<String, dynamic>>>{};
-    for (final video in videos) {
-      videoClipsById[video.id] = (await DatabaseService.getSubtitleClips(
-        video.id,
-      )).map((clip) => clip.toMap()).toList();
-    }
-
-    final audioClipsById = <String, List<Map<String, dynamic>>>{};
-    for (final audio in representativeAudios) {
-      audioClipsById[audio.id] = (await DatabaseService.getSubtitleClips(
-        audio.id,
-      )).map((clip) => clip.toMap()).toList();
-    }
-
-    return {
-      'project_id': projectId,
-      'videos': videos.map((video) => video.toMap()).toList(),
-      'audios': representativeAudios.map((audio) => audio.toMap()).toList(),
-      'audio_windows': audioWindows
-          .where(
-            (window) => representativeAudioIds.contains(window.mediaFileId),
-          )
-          .map((window) => window.toMap())
-          .toList(),
-      'video_clips_by_id': videoClipsById,
-      'audio_clips_by_id': audioClipsById,
-    };
+    return _MatchRuntimeData(
+      videos: videos,
+      audioById: {for (final audio in representativeAudios) audio.id: audio},
+      workerPayload: {
+        'project_id': projectId,
+        'audios': representativeAudios.map((audio) => audio.toMap()).toList(),
+        'audio_windows': audioWindows
+            .where(
+              (window) => representativeAudioIds.contains(window.mediaFileId),
+            )
+            .map((window) => window.toMap())
+            .toList(growable: false),
+      },
+    );
   }
 
-  static Future<Map<String, dynamic>> _runWorker(
-    Map<String, dynamic> payload, {
-    MatchProgressCallback? onProgress,
-    MatchExecutionController? controller,
-  }) async {
-    final receivePort = ReceivePort();
-    final completer = Completer<Map<String, dynamic>>();
-    Isolate? worker;
-    StreamSubscription<dynamic>? subscription;
-
-    void cleanup() {
-      subscription?.cancel();
-      receivePort.close();
-      worker?.kill(priority: Isolate.immediate);
-    }
-
-    subscription = receivePort.listen((message) {
-      if (message is! Map) return;
-      final type = message['type'];
-      if (type == 'progress') {
-        onProgress?.call(
-          MatchProgressUpdate(
-            stage: '${message['stage']}',
-            current: message['current'] as int? ?? 0,
-            total: message['total'] as int? ?? 0,
-            currentVideo: message['current_video'] as String?,
-            progress: (message['progress'] as num?)?.toDouble() ?? 0.0,
-          ),
-        );
-        return;
-      }
-      if (type == 'done') {
-        if (!completer.isCompleted) {
-          completer.complete(
-            (message['payload'] as Map).cast<String, dynamic>(),
-          );
-        }
-        cleanup();
-        return;
-      }
-      if (type == 'error') {
-        if (!completer.isCompleted) {
-          completer.completeError(
-            Exception(message['error'] ?? '匹配 worker 执行失败'),
-          );
-        }
-        cleanup();
-      }
-    });
-
-    worker = await Isolate.spawn<Map<String, dynamic>>(_matchWorkerEntry, {
-      'reply_port': receivePort.sendPort,
-      'payload': payload,
-    });
-
-    controller?.bindCancel(() {
-      if (!completer.isCompleted) {
-        completer.completeError(const MatchCancelledException());
-      }
-      cleanup();
-    });
-
-    return completer.future;
-  }
-
-  static void _matchWorkerEntry(Map<String, dynamic> message) {
+  static void _matchWorkerSessionEntry(Map<String, dynamic> message) {
     final replyPort = message['reply_port'] as SendPort;
     final payload = (message['payload'] as Map).cast<String, dynamic>();
     try {
-      final result = _runMatchWorkerSync(payload, replyPort);
-      replyPort.send({'type': 'done', 'payload': result});
+      final index = _MatchWorkerIndex.fromPayload(payload);
+      final commandPort = ReceivePort();
+      StreamSubscription<dynamic>? subscription;
+      subscription = commandPort.listen((command) {
+        if (command is! Map) return;
+        final type = command['type'];
+        if (type == 'dispose') {
+          subscription?.cancel();
+          commandPort.close();
+          return;
+        }
+        if (type != 'score_video') return;
+
+        final requestId = command['request_id'] as int? ?? 0;
+        try {
+          final result = _scoreVideoRequest(
+            index: index,
+            videoPayload: (command['video'] as Map).cast<String, dynamic>(),
+            videoClipsPayload: command['video_clips'] as List<dynamic>,
+            previousAudioId: command['previous_audio_id'] as String?,
+            previousAudioSourceIn: command['previous_audio_source_in'] as int?,
+          );
+          replyPort.send({
+            'type': 'video_done',
+            'request_id': requestId,
+            'payload': result,
+          });
+        } catch (e) {
+          replyPort.send({
+            'type': 'video_error',
+            'request_id': requestId,
+            'error': e.toString(),
+          });
+        }
+      });
+      replyPort.send({'type': 'ready', 'send_port': commandPort.sendPort});
     } catch (e) {
-      replyPort.send({'type': 'error', 'error': e.toString()});
+      replyPort.send({'type': 'fatal_error', 'error': e.toString()});
     }
   }
 
-  static Map<String, dynamic> _runMatchWorkerSync(
-    Map<String, dynamic> payload,
-    SendPort replyPort,
-  ) {
-    final projectId = payload['project_id'] as String;
-    final videos = (payload['videos'] as List<dynamic>)
+  static Map<String, dynamic> _scoreVideoRequest({
+    required _MatchWorkerIndex index,
+    required Map<String, dynamic> videoPayload,
+    required List<dynamic> videoClipsPayload,
+    required String? previousAudioId,
+    required int? previousAudioSourceIn,
+  }) {
+    final video = _WorkerMedia.fromMap(videoPayload);
+    final videoClips = videoClipsPayload
         .cast<Map<String, dynamic>>()
-        .map(_WorkerMedia.fromMap)
-        .toList();
-    final audios = (payload['audios'] as List<dynamic>)
-        .cast<Map<String, dynamic>>()
-        .map(_WorkerMedia.fromMap)
-        .toList();
-    final audioWindows = (payload['audio_windows'] as List<dynamic>)
-        .cast<Map<String, dynamic>>()
-        .map(_WorkerWindow.fromMap)
-        .toList();
-    final videoClipsById = (payload['video_clips_by_id'] as Map).map(
-      (key, value) => MapEntry(
-        key as String,
-        (value as List<dynamic>)
-            .cast<Map<String, dynamic>>()
-            .map(_WorkerClip.fromMap)
-            .toList(),
-      ),
+        .map(_WorkerClip.fromMap)
+        .toList(growable: false);
+    final videoWindows = _buildVideoWindows(video, index.projectId, videoClips);
+    final groupedCandidates = _scoreCandidates(
+      projectId: index.projectId,
+      video: video,
+      audioMap: index.audioMap,
+      audioWindowsBySize: index.audioWindowsBySize,
+      videoWindows: videoWindows,
+      previousAudioId: previousAudioId,
+      previousAudioSourceIn: previousAudioSourceIn,
     );
-    final audioClipsById = (payload['audio_clips_by_id'] as Map).map(
-      (key, value) => MapEntry(
-        key as String,
-        (value as List<dynamic>)
-            .cast<Map<String, dynamic>>()
-            .map(_WorkerClip.fromMap)
-            .toList(),
-      ),
-    );
-
-    final audioMap = {for (final audio in audios) audio.id: audio};
-    final audioWindowsBySize = <int, List<_WorkerWindow>>{};
-    for (final window in audioWindows) {
-      audioWindowsBySize.putIfAbsent(window.windowSize, () => []).add(window);
-    }
-
-    final candidates = <Map<String, dynamic>>[];
-    final syncResults = <Map<String, dynamic>>[];
-    final anchors = <Map<String, dynamic>>[];
-
-    String? previousAudioId;
-    int? previousAudioSourceIn;
-
-    for (var index = 0; index < videos.length; index++) {
-      final video = videos[index];
-      final videoClips = videoClipsById[video.id] ?? const <_WorkerClip>[];
-
-      replyPort.send({
-        'type': 'progress',
-        'stage': '检索候选',
-        'current': index + 1,
-        'total': videos.length,
-        'current_video': video.fileName,
-        'progress': videos.isEmpty ? 0.0 : ((index + 1) / videos.length) * 0.85,
-      });
-
-      if (videoClips.isEmpty) {
-        syncResults.add(
-          SyncResult(
-            id: _uuid.v4(),
-            projectId: projectId,
-            videoFileId: video.id,
-            audioFileId: null,
-            videoDurationMs: video.durationMs,
-            timelineStartMs: video.layoutStartMs,
-            timelineEndMs: video.layoutEndMs,
-            confidence: 0.0,
-            status: SyncStatus.noSubtitle,
-            method: SyncMethod.subtitleOnly,
-            reviewStatus: SyncReviewStatus.pending,
-            notes: '视频没有可用字幕',
-            createdAt: DateTime.now(),
-          ).toMap(),
-        );
-        continue;
-      }
-
-      final videoWindows = _buildVideoWindows(video, projectId, videoClips);
-      final groupedCandidates = _scoreCandidates(
-        projectId: projectId,
-        video: video,
-        audioMap: audioMap,
-        audioWindowsBySize: audioWindowsBySize,
-        videoWindows: videoWindows,
-        previousAudioId: previousAudioId,
-        previousAudioSourceIn: previousAudioSourceIn,
-      );
-      final orderedCandidates = groupedCandidates.values.toList()
-        ..sort((a, b) => b.totalScore.compareTo(a.totalScore));
-      candidates.addAll(
-        orderedCandidates
-            .take(AppConstants.topKCandidates)
-            .map((candidate) => candidate.toMap()),
-      );
-
-      if (orderedCandidates.isEmpty ||
-          orderedCandidates.first.totalScore <
-              AppConstants.matchConfidenceLow) {
-        syncResults.add(
-          SyncResult(
-            id: _uuid.v4(),
-            projectId: projectId,
-            videoFileId: video.id,
-            audioFileId: null,
-            videoDurationMs: video.durationMs,
-            timelineStartMs: video.layoutStartMs,
-            timelineEndMs: video.layoutEndMs,
-            confidence: orderedCandidates.isEmpty
-                ? 0.0
-                : orderedCandidates.first.totalScore,
-            status: SyncStatus.noMatch,
-            method: SyncMethod.subtitleOnly,
-            reviewStatus: SyncReviewStatus.pending,
-            notes: '未命中音频字幕库',
-            createdAt: DateTime.now(),
-          ).toMap(),
-        );
-        continue;
-      }
-
-      replyPort.send({
-        'type': 'progress',
-        'stage': '求锚点',
-        'current': index + 1,
-        'total': videos.length,
-        'current_video': video.fileName,
-        'progress': videos.isEmpty ? 0.0 : ((index + 1) / videos.length) * 0.9,
-      });
-
-      final best = orderedCandidates.first;
-      final bestAudio = audioMap[best.audioFileId];
-      final bestAudioClips = bestAudio == null
-          ? const <_WorkerClip>[]
-          : (audioClipsById[best.audioFileId] ?? const <_WorkerClip>[]);
-
-      final anchorBundle = _buildAnchors(
-        syncResultId: _uuid.v4(),
-        videoClips: videoClips,
-        audioClips: bestAudioClips,
-        fallbackOffsetMs: best.fallbackOffsetMs,
-      );
-      var audioSourceInMs = anchorBundle.offsetMs;
-      var audioSourceOutMs = audioSourceInMs + video.durationMs;
-
-      bool sourceClamped = false;
-      bool audioTooShort = false;
-      if (audioSourceInMs < 0) {
-        sourceClamped = true;
-        audioSourceInMs = 0;
-        audioSourceOutMs = video.durationMs;
-      }
-      final audioDurationMs = bestAudio?.durationMs ?? 0;
-      if (audioDurationMs > 0 && audioSourceOutMs > audioDurationMs) {
-        audioTooShort = true;
-        audioSourceOutMs = audioDurationMs;
-        if (audioSourceOutMs < audioSourceInMs) {
-          audioSourceOutMs = audioSourceInMs;
-        }
-      }
-
-      var confidence = best.totalScore;
-      if (videoClips.length < 2) {
-        confidence = math.min(
-          confidence,
-          AppConstants.matchConfidenceMedium + 0.05,
-        );
-      }
-      if (sourceClamped || audioTooShort) {
-        confidence *= 0.88;
-      }
-      if (anchorBundle.anchors.length <= 1) {
-        confidence *= 0.92;
-      }
-      confidence = confidence.clamp(0.0, 1.0);
-
-      final status = _buildStatus(
-        confidence: confidence,
-        sourceClamped: sourceClamped,
-        audioTooShort: audioTooShort,
-        hasSubtitle: true,
-        hasAudio: bestAudio != null,
-      );
-
-      syncResults.add(
-        SyncResult(
-          id: anchorBundle.syncResultId,
-          projectId: projectId,
-          videoFileId: video.id,
-          audioFileId: best.audioFileId,
-          videoDurationMs: video.durationMs,
-          timelineStartMs: video.layoutStartMs,
-          timelineEndMs: video.layoutEndMs,
-          audioSourceInMs: audioSourceInMs,
-          audioSourceOutMs: audioSourceOutMs,
-          confidence: confidence,
-          status: status,
-          method: SyncMethod.subtitleOnly,
-          anchorCount: anchorBundle.anchors.length,
-          sourceClamped: sourceClamped,
-          audioTooShort: audioTooShort,
-          reviewStatus: _initialReviewStatusForStatus(status),
-          notes: anchorBundle.notes,
-          createdAt: DateTime.now(),
-        ).toMap(),
-      );
-      anchors.addAll(anchorBundle.anchors.map((anchor) => anchor.toMap()));
-
-      previousAudioId = best.audioFileId;
-      previousAudioSourceIn = audioSourceInMs;
-    }
+    final orderedCandidates = groupedCandidates.values.toList()
+      ..sort((left, right) => right.totalScore.compareTo(left.totalScore));
 
     return {
-      'match_candidates': candidates,
-      'sync_results': syncResults,
-      'anchor_pairs': anchors,
+      'match_candidates': orderedCandidates
+          .take(AppConstants.topKCandidates)
+          .map((candidate) => candidate.toMap())
+          .toList(growable: false),
     };
   }
 

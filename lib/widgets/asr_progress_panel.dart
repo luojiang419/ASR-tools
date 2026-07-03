@@ -28,17 +28,19 @@ class AsrProgressPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final borderColor = isSelected
-        ? AppTheme.highlight.withValues(alpha: 0.6)
+        ? AppTheme.highlight.withValues(alpha: 0.24)
         : _statusBorderColor;
 
     final child = Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
       decoration: BoxDecoration(
         color: isSelected
-            ? AppTheme.highlight.withValues(alpha: 0.08)
-            : AppTheme.card,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: borderColor, width: isSelected ? 1.5 : 0.5),
+            ? AppTheme.highlight.withValues(alpha: 0.06)
+            : AppTheme.glassSurfaceStrong.withValues(
+                alpha: AppTheme.isDarkMode ? 0.44 : 0.82,
+              ),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: borderColor, width: isSelected ? 1.2 : 0.7),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -123,10 +125,10 @@ class AsrProgressPanel extends StatelessWidget {
             ),
           ],
           if (progress.status == AsrFileStatus.completed &&
-              progress.segments.isNotEmpty) ...[
+              progress.segmentCount > 0) ...[
             const SizedBox(height: 4),
             Text(
-              '识别到 ${progress.segments.length} 个段落',
+              '识别到 ${progress.segmentCount} 个段落',
               style: TextStyle(color: AppTheme.textSecondary, fontSize: 11),
             ),
           ],
@@ -148,13 +150,14 @@ class AsrProgressPanel extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
       decoration: BoxDecoration(
-        color: _statusColor.withValues(alpha: 0.15),
+        color: _statusColor.withValues(alpha: 0.1),
         borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: _statusColor.withValues(alpha: 0.18)),
       ),
       child: Text(
         progress.status.label,
         style: TextStyle(
-          color: _statusColor,
+          color: _statusColor.withValues(alpha: 0.94),
           fontSize: 11,
           fontWeight: FontWeight.w600,
         ),
@@ -208,11 +211,11 @@ class AsrProgressPanel extends StatelessWidget {
   Color get _statusBorderColor {
     switch (progress.status) {
       case AsrFileStatus.failed:
-        return AppTheme.error.withValues(alpha: 0.3);
+        return AppTheme.error.withValues(alpha: 0.18);
       case AsrFileStatus.completed:
-        return AppTheme.success.withValues(alpha: 0.3);
+        return AppTheme.success.withValues(alpha: 0.18);
       case AsrFileStatus.cancelled:
-        return AppTheme.warning.withValues(alpha: 0.3);
+        return AppTheme.warning.withValues(alpha: 0.18);
       default:
         return AppTheme.border;
     }
